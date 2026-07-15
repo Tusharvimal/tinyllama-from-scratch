@@ -95,7 +95,7 @@ profile_model.py       # torch.profiler-based operator- and block-level profilin
 
 ## Environment
 
-- WSL2 Ubuntu, RTX 5070 (laptop)
+- WSL2 Ubuntu, RTX 5070 
 - `conda` environment: `cuda_env`
 - PyTorch (CUDA-enabled), `transformers`
 
