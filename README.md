@@ -108,3 +108,4 @@ python tinyllama_model.py   # sanity check: random-init forward pass, output sha
 python verify_model.py       # loads real weights, compares against HF reference
 python profile_model.py      # profiles compute breakdown
 ```
+# test
