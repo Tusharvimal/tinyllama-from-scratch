@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import json
 import os
 import torch.distributed as dist
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -69,7 +70,9 @@ class GroupedQueryAttentionSplit(nn.Module):
         output = attn_weights @ V
         output = output.transpose(0, 1).reshape(seq_len, self.num_q_heads_local * self.head_dim)
         output = self.W_o(output)
-        dist.all_reduce(output, op = dist.ReduceOp.SUM)
+        # print(f"[rank {dist.get_rank()}] attn about to all_reduce", flush=True)
+        dist.all_reduce(output, op=dist.ReduceOp.SUM)
+        # print(f"[rank {dist.get_rank()}] attn finished all_reduce", flush=True)
         return output
 
 class GroupedQueryAttention(nn.Module):
@@ -151,7 +154,9 @@ class MLPSplit(nn.Module):
         up = self.up_proj(x)
         fused = F.silu(gate) * up
         output = self.down_proj(fused)
-        dist.all_reduce(output, op = dist.ReduceOp.SUM)
+        # print(f"[rank {dist.get_rank()}] MLP about to all_reduce", flush=True)
+        dist.all_reduce(output, op=dist.ReduceOp.SUM)
+        # print(f"[rank {dist.get_rank()}] MLP finished all_reduce", flush=True)
         return output
 
 
@@ -316,31 +321,11 @@ def load_pretrained_weights_split(model, hf_model, num_layers):
 
     return model
 
-import time
-
-def main():
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    dist.init_process_group(backend="nccl")
-    device = torch.device(f"cuda:{rank}")
-
-    vocab_size, d_model, num_q_heads, num_kv_heads, d_ff, num_layers = 32000, 2048, 32, 4, 5632, 22
-
-    model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-    hf_model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float32, attn_implementation="eager")
-    hf_model = hf_model.to(device)
-
-    # Build the SPLIT model for this rank
-    split_model = TinyLlamaModelSplit(vocab_size, d_model, num_q_heads, num_kv_heads, d_ff, num_layers, world_size, rank)
-    split_model = split_model.to(device)
-    load_pretrained_weights_split(split_model, hf_model, num_layers)
-
-    # Same input on every rank
-    seq_len = 1000
+def run_benchmark(seq_len, rank, world_size, device, split_model, original_model, vocab_size):
     torch.manual_seed(42)
     token_ids = torch.randint(0, vocab_size, (seq_len,), device=device)
 
-    # Warm-up pass (first CUDA call always has extra overhead, don't time it)
+    # Warm-up (untimed)
     with torch.no_grad():
         _ = split_model(token_ids)
     torch.cuda.synchronize()
@@ -350,17 +335,12 @@ def main():
     with torch.no_grad():
         split_logits = split_model(token_ids)
     torch.cuda.synchronize()
-    split_elapsed = time.time() - start
+    split_elapsed = (time.time() - start) * 1000  # ms
+
+    result = {"seq_len": seq_len, "split_ms": split_elapsed}
 
     if rank == 0:
-        print(f"Split model forward pass: {split_elapsed*1000:.2f} ms")
-
-        # Build the ORIGINAL (unsplit) model only on rank 0 for comparison
-        original_model = TinyLlamaModel(vocab_size, d_model, num_q_heads, num_kv_heads, d_ff, num_layers)
-        original_model = original_model.to(device)
-        load_pretrained_weights(original_model, hf_model, num_layers)
-
-        # Warm-up pass for original too
+        # Warm-up original (untimed)
         with torch.no_grad():
             _ = original_model(token_ids)
         torch.cuda.synchronize()
@@ -370,14 +350,104 @@ def main():
         with torch.no_grad():
             original_logits = original_model(token_ids)
         torch.cuda.synchronize()
-        original_elapsed = time.time() - start
-        print(f"Original model forward pass: {original_elapsed*1000:.2f} ms")
+        original_elapsed = (time.time() - start) * 1000
 
-        # Correctness check
-        cos_sim = F.cosine_similarity(split_logits.flatten(), original_logits.flatten(), dim=0)
+        cos_sim = F.cosine_similarity(split_logits.flatten(), original_logits.flatten(), dim=0).item()
         max_diff = (split_logits - original_logits).abs().max().item()
-        print(f"Cosine similarity: {cos_sim.item():.6f}")
-        print(f"Max abs diff: {max_diff:.8f}")
+
+        result["original_ms"] = original_elapsed
+        result["cosine_similarity"] = cos_sim
+        result["max_abs_diff"] = max_diff
+        result["speedup"] = original_elapsed / split_elapsed
+
+    return result
+
+def main():
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id = device)
+
+    vocab_size, d_model, num_q_heads, num_kv_heads, d_ff, num_layers = 32000, 2048, 32, 4, 5632, 22
+
+    model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    hf_model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float32, attn_implementation="eager")
+    hf_model = hf_model.to(device)
+
+    seq_lens = [5, 100, 500]
+    original_results = {}
+
+    # Phase 1: rank 0 only — build, time, then FREE the original model before touching split
+    if rank == 0:
+        original_model = TinyLlamaModel(vocab_size, d_model, num_q_heads, num_kv_heads, d_ff, num_layers)
+        original_model = original_model.to(device)
+        load_pretrained_weights(original_model, hf_model, num_layers)
+
+        for seq_len in seq_lens:
+            torch.manual_seed(42)
+            token_ids = torch.randint(0, vocab_size, (seq_len,), device=device)
+
+            with torch.no_grad():
+                _ = original_model(token_ids)
+            torch.cuda.synchronize()
+
+            start = time.time()
+            with torch.no_grad():
+                original_logits = original_model(token_ids)
+            torch.cuda.synchronize()
+            original_elapsed = (time.time() - start) * 1000
+
+            original_results[seq_len] = {
+                "original_ms": original_elapsed,
+                "logits": original_logits.clone()  # clone so it survives after model is deleted
+            }
+            print(f"[original] seq_len={seq_len}: {original_elapsed:.2f}ms", flush=True)
+
+        del original_model
+        torch.cuda.empty_cache()
+        print("Freed original model from memory.", flush=True)
+
+    dist.barrier(device_ids = [rank])  # make sure rank 0 is fully done before anyone touches the split model
+
+    # Phase 2: both ranks — build split model fresh, now that rank 0's GPU is clean
+    split_model = TinyLlamaModelSplit(vocab_size, d_model, num_q_heads, num_kv_heads, d_ff, num_layers, world_size, rank)
+    split_model = split_model.to(device)
+    load_pretrained_weights_split(split_model, hf_model, num_layers)
+
+    all_results = []
+    for seq_len in seq_lens:
+        torch.manual_seed(42)
+        token_ids = torch.randint(0, vocab_size, (seq_len,), device=device)
+
+        with torch.no_grad():
+            _ = split_model(token_ids)
+        torch.cuda.synchronize()
+
+        start = time.time()
+        with torch.no_grad():
+            split_logits = split_model(token_ids)
+        torch.cuda.synchronize()
+        split_elapsed = (time.time() - start) * 1000
+
+        if rank == 0:
+            orig = original_results[seq_len]
+            cos_sim = F.cosine_similarity(split_logits.flatten(), orig["logits"].flatten(), dim=0).item()
+            max_diff = (split_logits - orig["logits"]).abs().max().item()
+
+            result = {
+                "seq_len": seq_len, "split_ms": split_elapsed, "original_ms": orig["original_ms"],
+                "speedup": orig["original_ms"] / split_elapsed,
+                "cosine_similarity": cos_sim, "max_abs_diff": max_diff
+            }
+            print(f"seq_len={seq_len} | split={split_elapsed:.2f}ms | original={orig['original_ms']:.2f}ms | "
+                  f"speedup={result['speedup']:.2f}x | cos_sim={cos_sim:.6f} | max_diff={max_diff:.8f}", flush=True)
+            all_results.append(result)
+
+    if rank == 0:
+        with open("tp_benchmark_results.json", "w") as f:
+            json.dump(all_results, f, indent=2)
+        print("Saved results to tp_benchmark_results.json", flush=True)
 
     dist.destroy_process_group()
 

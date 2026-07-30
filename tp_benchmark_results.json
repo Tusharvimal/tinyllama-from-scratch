@@ -1,0 +1,26 @@
+[
+  {
+    "seq_len": 5,
+    "split_ms": 23.746967315673828,
+    "original_ms": 21.162986755371094,
+    "speedup": 0.8911869239573502,
+    "cosine_similarity": 1.0,
+    "max_abs_diff": 3.0040740966796875e-05
+  },
+  {
+    "seq_len": 100,
+    "split_ms": 46.521663665771484,
+    "original_ms": 22.585153579711914,
+    "speedup": 0.48547605137193406,
+    "cosine_similarity": 0.9999999403953552,
+    "max_abs_diff": 3.147125244140625e-05
+  },
+  {
+    "seq_len": 500,
+    "split_ms": 121.35887145996094,
+    "original_ms": 86.99727058410645,
+    "speedup": 0.7168595879107926,
+    "cosine_similarity": 1.0,
+    "max_abs_diff": 4.6253204345703125e-05
+  }
+]
